@@ -39,6 +39,10 @@ CREATE TABLE IF NOT EXISTS queue(
  UNIQUE(user_id,step));
 CREATE TABLE IF NOT EXISTS logs(
  id INTEGER PRIMARY KEY AUTOINCREMENT,created_at TEXT,level TEXT,message TEXT);
+CREATE TABLE IF NOT EXISTS resends(
+ id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,step INTEGER DEFAULT 1,
+ due_at TEXT,status TEXT DEFAULT 'pending',sent_at TEXT,error TEXT,message_text TEXT,
+ created_at TEXT);
 """)
 # Migrasi aman untuk database deployment versi sebelumnya.
 queue_columns = {row[1] for row in db.execute("PRAGMA table_info(queue)")}
@@ -73,13 +77,32 @@ def log(level, message):
 def authorized(request): return request.session.get("auth") is True
 def redirect(path="/"): return RedirectResponse(path, status_code=303)
 
+def sent_today_count():
+    """Hitung pengiriman berdasarkan tanggal kalender WIB, bukan timezone server."""
+    today_wib = now().date()
+    rows = db.execute("""SELECT sent_at FROM queue WHERE status='sent' AND sent_at IS NOT NULL
+      UNION ALL SELECT sent_at FROM resends WHERE status='sent' AND sent_at IS NOT NULL""").fetchall()
+    total = 0
+    for row in rows:
+        try:
+            dt = datetime.fromisoformat(row[0])
+            if dt.tzinfo is None: dt = dt.replace(tzinfo=TZ)
+            if dt.astimezone(TZ).date() == today_wib: total += 1
+        except (TypeError,ValueError):
+            continue
+    return total
+
+def next_reset_text():
+    tomorrow = now().date() + timedelta(days=1)
+    return datetime.combine(tomorrow, datetime.min.time(), tzinfo=TZ).strftime("%d-%m-%Y 00:00 WIB")
+
 STYLE = """
 body{margin:0;background:#090b10;color:#e8e9ec;font:14px Arial}nav{background:#11151d;padding:15px 5%;display:flex;gap:18px}nav a{color:#f1c75b;text-decoration:none}.wrap{max-width:1100px;margin:24px auto;padding:0 18px}.card{background:#121720;border:1px solid #252d3a;border-radius:12px;padding:18px;margin:14px 0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}.stat{font-size:26px;color:#f1c75b}input,textarea,select{width:100%;box-sizing:border-box;background:#090d13;color:white;border:1px solid #333d4e;border-radius:7px;padding:10px;margin:6px 0 12px}button,.btn{background:#e6b94b;color:#111;border:0;border-radius:7px;padding:10px 14px;font-weight:bold;cursor:pointer;text-decoration:none;display:inline-block}button.danger{background:#d95b5b;color:white}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:9px;border-bottom:1px solid #29313e}.muted{color:#98a1af}.ok{color:#70d69b}.bad{color:#ff7f7f}.flash{background:#22334a;padding:10px;border-radius:7px}@media(max-width:700px){table{font-size:12px}.hide-mobile{display:none}}
 """
 
 def page(title, body, request=None):
     flash = request.session.pop("flash", "") if request else ""
-    nav = "<nav><b>OMTOGEL Follow-up</b><a href='/'>Dashboard</a><a href='/contacts'>Kontak</a><a href='/history'>Riwayat Terkirim</a><a href='/settings'>Pengaturan</a><a href='/telegram'>Telegram</a><a href='/logout'>Keluar</a></nav>" if request and authorized(request) else ""
+    nav = "<nav><b>KENZO DEV - Follow up</b><a href='/'>Dashboard</a><a href='/contacts'>Kontak</a><a href='/history'>Riwayat Terkirim</a><a href='/campaign/resend'>Kampanye Kirim Ulang</a><a href='/settings'>Pengaturan</a><a href='/telegram'>Telegram</a><a href='/logout'>Keluar</a></nav>" if request and authorized(request) else ""
     return HTMLResponse(f"<!doctype html><html><head><meta name='viewport' content='width=device-width'><title>{title}</title><style>{STYLE}</style></head><body>{nav}<main class='wrap'>{('<div class=flash>'+flash+'</div>') if flash else ''}{body}</main></body></html>")
 
 @asynccontextmanager
@@ -120,12 +143,12 @@ def logout(request: Request): request.session.clear(); return redirect("/login")
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
     if not authorized(request): return redirect("/login")
-    counts = {r["status"]: r["n"] for r in db.execute("SELECT status,count(*) n FROM queue GROUP BY status")}
+    counts = {r["status"]: r["n"] for r in db.execute("SELECT status,count(*) n FROM (SELECT status FROM queue UNION ALL SELECT status FROM resends) GROUP BY status")}
     contacts = db.execute("SELECT count(*) FROM contacts").fetchone()[0]
     selected = db.execute("SELECT count(*) FROM contacts WHERE selected=1 AND blocked=0").fetchone()[0]
-    sent_today = db.execute("SELECT count(*) FROM queue WHERE status='sent' AND substr(sent_at,1,10)=?", (now().date().isoformat(),)).fetchone()[0]
+    sent_today = sent_today_count()
     connected = bool(client and await client.is_user_authorized())
-    body = f"<h1>Dashboard Follow-up</h1><div class=grid><div class=card><div class=muted>Kontak valid</div><div class=stat>{contacts}</div></div><div class=card><div class=muted>Dipilih</div><div class=stat>{selected}</div></div><div class=card><div class=muted>Terkirim hari ini</div><div class=stat>{sent_today}</div></div><div class=card><div class=muted>Telegram</div><div class='stat {'ok' if connected else 'bad'}'>{'Terhubung' if connected else 'Belum login'}</div></div></div><div class=card><h3>Kampanye</h3><p>Status: <b>{'AKTIF' if setting('campaign_active')=='1' else 'NONAKTIF'}</b> · Pending: {counts.get('pending',0)} · Dibalas: {counts.get('replied',0)} · Gagal: {counts.get('failed',0)}</p><form method=post action='/campaign/start' style='display:inline'><button>Mulai / Lanjutkan</button></form> <form method=post action='/campaign/stop' style='display:inline'><button class=danger>Hentikan</button></form></div><div class=card><h3>Cara penggunaan</h3><ol><li>Login Telegram Official pada menu Telegram.</li><li>Sinkronkan chat masuk.</li><li>Pilih penerima pada menu Kontak.</li><li>Periksa pesan dan batas pengiriman.</li><li>Mulai kampanye.</li></ol></div>"
+    body = f"<h1>Dashboard Follow-up</h1><div class=grid><div class=card><div class=muted>Kontak valid</div><div class=stat>{contacts}</div></div><div class=card><div class=muted>Dipilih</div><div class=stat>{selected}</div></div><div class=card><div class=muted>Kuota hari ini</div><div class=stat>{sent_today} / {setting('daily_limit')}</div><small class=muted>Reset: {next_reset_text()}</small></div><div class=card><div class=muted>Telegram</div><div class='stat {'ok' if connected else 'bad'}'>{'Terhubung' if connected else 'Belum login'}</div></div></div><div class=card><h3>Kampanye</h3><p>Status: <b>{'AKTIF' if setting('campaign_active')=='1' else 'NONAKTIF'}</b> · Pending: {counts.get('pending',0)} · Dibalas: {counts.get('replied',0)} · Gagal: {counts.get('failed',0)}</p><p class=muted>Jika kuota harian habis, antrean berhenti sementara dan lanjut otomatis setelah pukul 00.00 WIB.</p><form method=post action='/campaign/start' style='display:inline'><button>Mulai / Lanjutkan</button></form> <form method=post action='/campaign/stop' style='display:inline'><button class=danger>Hentikan</button></form></div><div class=card><h3>Cara penggunaan</h3><ol><li>Login Telegram Official pada menu Telegram.</li><li>Sinkronkan chat masuk.</li><li>Pilih penerima pada menu Kontak.</li><li>Periksa pesan dan batas pengiriman.</li><li>Mulai kampanye.</li></ol></div>"
     return page("Dashboard", body, request)
 
 @app.get("/telegram", response_class=HTMLResponse)
@@ -213,13 +236,17 @@ def history(request: Request, status: str = "all", q: str = ""):
     if status != "all":
         conditions.append("q.status=?"); params.append(status)
     if q.strip():
-        conditions.append("(c.name LIKE ? OR c.username LIKE ? OR CAST(q.user_id AS TEXT) LIKE ?)")
+        conditions.append("(q.name LIKE ? OR q.username LIKE ? OR CAST(q.user_id AS TEXT) LIKE ?)")
         needle = f"%{q.strip()}%"; params.extend([needle, needle, needle])
     where = "WHERE " + " AND ".join(conditions) if conditions else ""
-    rows = db.execute(f"""SELECT q.id,q.user_id,q.step,q.due_at,q.status,q.sent_at,q.error,q.message_text,
-      c.name,c.username FROM queue q LEFT JOIN contacts c ON c.user_id=q.user_id
-      {where} ORDER BY COALESCE(q.sent_at,q.due_at) DESC,q.id DESC LIMIT 2000""", params).fetchall()
-    counts = {r["status"]: r["n"] for r in db.execute("SELECT status,count(*) n FROM queue GROUP BY status")}
+    rows = db.execute(f"""SELECT * FROM (
+      SELECT 'normal' source,q.id,q.user_id,q.step,q.due_at,q.status,q.sent_at,q.error,q.message_text,c.name,c.username
+      FROM queue q LEFT JOIN contacts c ON c.user_id=q.user_id
+      UNION ALL
+      SELECT 'resend' source,r.id,r.user_id,r.step,r.due_at,r.status,r.sent_at,r.error,r.message_text,c.name,c.username
+      FROM resends r LEFT JOIN contacts c ON c.user_id=r.user_id
+      ) q {where} ORDER BY COALESCE(q.sent_at,q.due_at) DESC,q.id DESC LIMIT 2000""", params).fetchall()
+    counts = {r["status"]: r["n"] for r in db.execute("SELECT status,count(*) n FROM (SELECT status FROM queue UNION ALL SELECT status FROM resends) GROUP BY status")}
     labels = {"pending":"Menunggu", "sent":"Terkirim", "replied":"Dibalas", "failed":"Gagal"}
     options = "".join(f"<option value='{s}' {'selected' if status==s else ''}>{'Semua status' if s=='all' else labels[s]}</option>" for s in ["all","sent","replied","pending","failed"])
     trs = ""
@@ -227,9 +254,90 @@ def history(request: Request, status: str = "all", q: str = ""):
         message = r["message_text"] or (setting(f"message_{r['step']}") if r["status"] == "pending" else "Pesan versi lama (isi belum direkam)")
         time_value = r["sent_at"] or r["due_at"] or ""
         badge_class = "ok" if r["status"] in {"sent","replied"} else ("bad" if r["status"]=="failed" else "muted")
-        trs += f"<tr><td>{html.escape(r['name'] or str(r['user_id']))}<br><span class=muted>@{html.escape(r['username'] or '-')}</span></td><td>{r['step']}</td><td style='max-width:380px;white-space:pre-wrap'>{html.escape(message)}</td><td>{html.escape(time_value[:16].replace('T',' '))} WIB</td><td class={badge_class}>{labels.get(r['status'],r['status'])}</td><td class=bad>{html.escape(r['error'] or '')}</td></tr>"
-    body = f"<h1>Riwayat Terkirim</h1><div class=grid><div class=card><div class=muted>Terkirim</div><div class=stat>{counts.get('sent',0)}</div></div><div class=card><div class=muted>Dibalas</div><div class=stat>{counts.get('replied',0)}</div></div><div class=card><div class=muted>Menunggu</div><div class=stat>{counts.get('pending',0)}</div></div><div class=card><div class=muted>Gagal</div><div class=stat>{counts.get('failed',0)}</div></div></div><div class=card><form method=get class=grid><div><label>Cari nama, username, atau ID</label><input name=q value='{html.escape(q, quote=True)}' placeholder='Cari penerima...'></div><div><label>Status</label><select name=status>{options}</select></div><div style='align-self:end'><button>Tampilkan</button> <a class=btn href='/history'>Reset</a></div></form><div style='overflow:auto'><table><thead><tr><th>Penerima</th><th>Tahap</th><th>Isi pesan</th><th>Waktu</th><th>Status</th><th>Error</th></tr></thead><tbody>{trs or '<tr><td colspan=6>Belum ada riwayat.</td></tr>'}</tbody></table></div></div>"
+        action = f"<a class=btn href='/history/resend/{r['source']}/{r['id']}'>Kirim Lagi</a>" if r["status"] in {"sent","replied","failed"} else "-"
+        type_label = "<br><span class=muted>Pengiriman ulang</span>" if r["source"] == "resend" else ""
+        trs += f"<tr><td>{html.escape(r['name'] or str(r['user_id']))}<br><span class=muted>@{html.escape(r['username'] or '-')}</span>{type_label}</td><td>{r['step']}</td><td style='max-width:380px;white-space:pre-wrap'>{html.escape(message)}</td><td>{html.escape(time_value[:16].replace('T',' '))} WIB</td><td class={badge_class}>{labels.get(r['status'],r['status'])}</td><td class=bad>{html.escape(r['error'] or '')}</td><td>{action}</td></tr>"
+    body = f"<h1>Riwayat Terkirim</h1><div class=grid><div class=card><div class=muted>Terkirim</div><div class=stat>{counts.get('sent',0)}</div></div><div class=card><div class=muted>Dibalas</div><div class=stat>{counts.get('replied',0)}</div></div><div class=card><div class=muted>Menunggu</div><div class=stat>{counts.get('pending',0)}</div></div><div class=card><div class=muted>Gagal</div><div class=stat>{counts.get('failed',0)}</div></div></div><div class=card><form method=get class=grid><div><label>Cari nama, username, atau ID</label><input name=q value='{html.escape(q, quote=True)}' placeholder='Cari penerima...'></div><div><label>Status</label><select name=status>{options}</select></div><div style='align-self:end'><button>Tampilkan</button> <a class=btn href='/history'>Reset</a></div></form><div style='overflow:auto'><table><thead><tr><th>Penerima</th><th>Tahap</th><th>Isi pesan</th><th>Waktu</th><th>Status</th><th>Error</th><th>Aksi</th></tr></thead><tbody>{trs or '<tr><td colspan=7>Belum ada riwayat.</td></tr>'}</tbody></table></div></div>"
     return page("Riwayat Terkirim", body, request)
+
+@app.get("/history/resend/{source}/{item_id}", response_class=HTMLResponse)
+def resend_confirm(request: Request, source: str, item_id: int):
+    if not authorized(request): return redirect("/login")
+    table = "resends" if source == "resend" else "queue"
+    item = db.execute(f"SELECT x.*,c.name,c.username FROM {table} x LEFT JOIN contacts c ON c.user_id=x.user_id WHERE x.id=?", (item_id,)).fetchone()
+    if not item: request.session["flash"]="Riwayat tidak ditemukan."; return redirect("/history")
+    message = item["message_text"] or setting(f"message_{item['step']}")
+    body = f"<h1>Konfirmasi Kirim Lagi</h1><div class=card><p>Penerima: <b>{html.escape(item['name'] or str(item['user_id']))}</b> @{html.escape(item['username'] or '-')}</p><label>Pesan yang akan dikirim</label><div class=card style='white-space:pre-wrap'>{html.escape(message)}</div><p class=bad>Pesan ini sengaja dikirim ulang dan akan tercatat sebagai riwayat baru.</p><form method=post><input type=hidden name=message value='{html.escape(message,quote=True)}'><button>Kirim Lagi Sekarang</button> <a class=btn href='/history'>Batal</a></form></div>"
+    return page("Konfirmasi Kirim Lagi", body, request)
+
+@app.post("/history/resend/{source}/{item_id}")
+def resend_create(request: Request, source: str, item_id: int, message: str = Form(...)):
+    if not authorized(request): return redirect("/login")
+    table = "resends" if source == "resend" else "queue"
+    item = db.execute(f"SELECT user_id,step FROM {table} WHERE id=?", (item_id,)).fetchone()
+    if not item: request.session["flash"]="Riwayat tidak ditemukan."; return redirect("/history")
+    contact = db.execute("SELECT blocked FROM contacts WHERE user_id=?", (item["user_id"],)).fetchone()
+    if contact and contact["blocked"]:
+        request.session["flash"] = "Penerima berstatus STOP/blacklist, pengiriman ulang dibatalkan."
+        return redirect("/history")
+    db.execute("INSERT INTO resends(user_id,step,due_at,status,message_text,created_at) VALUES(?,?,?,'pending',?,?)", (item["user_id"],item["step"],iso(),message,iso()))
+    db.commit(); set_setting("campaign_active","1")
+    request.session["flash"] = "Pengiriman ulang dimasukkan ke antrean."
+    return redirect("/history?status=pending")
+
+@app.get("/campaign/resend", response_class=HTMLResponse)
+def bulk_resend_page(request: Request, q: str = ""):
+    if not authorized(request): return redirect("/login")
+    params = []
+    search_sql = ""
+    if q.strip():
+        search_sql = "AND (c.name LIKE ? OR c.username LIKE ? OR CAST(c.user_id AS TEXT) LIKE ?)"
+        needle = f"%{q.strip()}%"; params = [needle,needle,needle]
+    rows = db.execute(f"""SELECT c.user_id,c.name,c.username,c.last_inbound,
+      MAX(x.sent_at) last_sent,COUNT(*) total_sent
+      FROM contacts c JOIN (
+        SELECT user_id,sent_at FROM queue WHERE status IN ('sent','replied')
+        UNION ALL SELECT user_id,sent_at FROM resends WHERE status IN ('sent','replied')
+      ) x ON x.user_id=c.user_id
+      WHERE c.blocked=0 {search_sql}
+      GROUP BY c.user_id,c.name,c.username,c.last_inbound
+      ORDER BY last_sent DESC LIMIT 900""", params).fetchall()
+    trs = "".join(f"<tr><td><input type=checkbox name=ids value='{r['user_id']}'></td><td>{html.escape(r['name'] or str(r['user_id']))}<br><span class=muted>@{html.escape(r['username'] or '-')}</span></td><td>{html.escape((r['last_sent'] or '')[:16].replace('T',' '))} WIB</td><td>{r['total_sent']}</td></tr>" for r in rows)
+    default_message = "Halo Bosku 😊 Kami ingin menghubungi Anda kembali. Apakah saat ini ada yang bisa kami bantu? Silakan balas pesan ini. Ketik STOP jika tidak ingin menerima follow-up lagi."
+    body = f"<h1>Kampanye Kirim Ulang</h1><div class=card><p class=muted>Daftar hanya berisi orang yang sebelumnya pernah menerima follow-up. Akun STOP/blacklist otomatis tidak ditampilkan.</p><form method=get><div class=grid><div><label>Cari penerima</label><input name=q value='{html.escape(q,quote=True)}' placeholder='Nama, username, atau ID'></div><div style='align-self:end'><button>Cari</button> <a class=btn href='/campaign/resend'>Reset</a></div></div></form></div><div class=card><form method=post><label>Pesan kampanye kirim ulang</label><textarea name=message rows=5 required>{html.escape(default_message)}</textarea><p><button type=button onclick=\"document.querySelectorAll('[name=ids]').forEach(x=>x.checked=true)\">Pilih Semua Tampil</button> <button type=button onclick=\"document.querySelectorAll('[name=ids]').forEach(x=>x.checked=false)\">Kosongkan</button></p><div style='overflow:auto;max-height:520px'><table><thead><tr><th>Pilih</th><th>Penerima</th><th>Terakhir dikirim</th><th>Total kirim</th></tr></thead><tbody>{trs or '<tr><td colspan=4>Tidak ada penerima yang sesuai.</td></tr>'}</tbody></table></div><label style='display:block;margin:18px 0'><input style='width:auto' type=checkbox name=confirm value=yes required> Saya sudah memeriksa penerima dan menyetujui kampanye ini.</label><button>Buat Kampanye Kirim Ulang</button></form></div>"
+    return page("Kampanye Kirim Ulang", body, request)
+
+@app.post("/campaign/resend")
+async def bulk_resend_create(request: Request):
+    if not authorized(request): return redirect("/login")
+    form = await request.form()
+    if form.get("confirm") != "yes":
+        request.session["flash"] = "Konfirmasi kampanye wajib dicentang."
+        return redirect("/campaign/resend")
+    message = str(form.get("message", "")).strip()
+    if not message or len(message) > 4000:
+        request.session["flash"] = "Pesan wajib diisi dan maksimal 4.000 karakter."
+        return redirect("/campaign/resend")
+    raw_ids = list(dict.fromkeys(form.getlist("ids")))[:900]
+    ids = []
+    for value in raw_ids:
+        try: ids.append(int(value))
+        except (TypeError,ValueError): pass
+    if not ids:
+        request.session["flash"] = "Pilih minimal satu penerima."
+        return redirect("/campaign/resend")
+    placeholders = ",".join("?" for _ in ids)
+    valid = db.execute(f"SELECT user_id FROM contacts WHERE blocked=0 AND user_id IN ({placeholders})", ids).fetchall()
+    created = 0
+    for row in valid:
+        # Hindari antrean pengiriman ulang ganda yang masih menunggu untuk user yang sama.
+        pending = db.execute("SELECT 1 FROM resends WHERE user_id=? AND status='pending'", (row["user_id"],)).fetchone()
+        if pending: continue
+        db.execute("INSERT INTO resends(user_id,step,due_at,status,message_text,created_at) VALUES(?,1,?,'pending',?,?)", (row["user_id"],iso(),message,iso()))
+        created += 1
+    db.commit(); set_setting("campaign_active","1")
+    request.session["flash"] = f"Kampanye dibuat: {created} penerima masuk antrean; {len(valid)-created} dilewati karena sudah menunggu."
+    return redirect("/history?status=pending")
 
 @app.post("/contacts/select")
 async def select_contacts(request: Request):
@@ -243,14 +351,25 @@ async def select_contacts(request: Request):
 @app.get("/settings", response_class=HTMLResponse)
 def settings_page(request: Request):
     if not authorized(request): return redirect("/login")
-    body = f"<h1>Pengaturan</h1><div class=card><form method=post><label>Pesan pertama</label><textarea name=message_1 rows=4>{setting('message_1')}</textarea><label>Pesan kedua</label><textarea name=message_2 rows=4>{setting('message_2')}</textarea><label>Pesan ketiga</label><textarea name=message_3 rows=4>{setting('message_3')}</textarea><div class=grid><div><label>Usia chat (hari) — isi 0 untuk semua riwayat</label><input type=number min=0 max=3650 name=max_age_days value={setting('max_age_days')}></div><div><label>Batas kirim per hari</label><input type=number min=1 max=100 name=daily_limit value={setting('daily_limit')}></div><div><label>Jeda setiap kirim (detik)</label><input type=number min=30 max=3600 name=interval_seconds value={setting('interval_seconds')}></div><div><label>Follow-up kedua (jam)</label><input type=number min=1 name=step2_hours value={setting('step2_hours')}></div><div><label>Follow-up ketiga (jam dari pertama)</label><input type=number min=2 name=step3_hours value={setting('step3_hours')}></div></div><button>Simpan Pengaturan</button></form></div>"
+    body = f"<h1>Pengaturan</h1><div class=card><form method=post><label>Pesan pertama</label><textarea name=message_1 rows=4>{setting('message_1')}</textarea><label>Pesan kedua</label><textarea name=message_2 rows=4>{setting('message_2')}</textarea><label>Pesan ketiga</label><textarea name=message_3 rows=4>{setting('message_3')}</textarea><div class=grid><div><label>Usia chat (hari) — isi 0 untuk semua riwayat</label><input type=number min=0 max=3650 name=max_age_days value={setting('max_age_days')}></div><div><label>Batas kirim per hari (maks. 1.000)</label><input type=number min=1 max=1000 name=daily_limit value={setting('daily_limit')}></div><div><label>Jeda setiap kirim (detik)</label><input type=number min=30 max=3600 name=interval_seconds value={setting('interval_seconds')}></div><div><label>Follow-up kedua (jam)</label><input type=number min=1 name=step2_hours value={setting('step2_hours')}></div><div><label>Follow-up ketiga (jam dari pertama)</label><input type=number min=2 name=step3_hours value={setting('step3_hours')}></div></div><p class=muted>Kuota kembali ke 0 otomatis setiap pukul 00.00 WIB. Telegram tetap dapat memberlakukan FloodWait jika pengiriman terlalu cepat.</p><button>Simpan Pengaturan</button></form></div>"
     return page("Pengaturan", body, request)
 
 @app.post("/settings")
 async def save_settings(request: Request):
     if not authorized(request): return redirect("/login")
     form = await request.form()
-    for key in ["message_1","message_2","message_3","max_age_days","daily_limit","interval_seconds","step2_hours","step3_hours"]: set_setting(key, form[key])
+    set_setting("message_1", str(form["message_1"])[:4000])
+    set_setting("message_2", str(form["message_2"])[:4000])
+    set_setting("message_3", str(form["message_3"])[:4000])
+    numeric_limits = {
+        "max_age_days": (0,3650), "daily_limit": (1,1000),
+        "interval_seconds": (30,3600), "step2_hours": (1,8760),
+        "step3_hours": (2,17520)
+    }
+    for key,(minimum,maximum) in numeric_limits.items():
+        try: value = int(form[key])
+        except (TypeError,ValueError): value = int(DEFAULTS[key])
+        set_setting(key, max(minimum,min(maximum,value)))
     request.session["flash"] = "Pengaturan disimpan."
     return redirect("/settings")
 
@@ -272,7 +391,7 @@ async def on_new_message(event):
     if not event.is_private: return
     sender = await event.get_sender(); uid = event.sender_id
     text = (event.raw_text or "").strip().lower()
-    existing = db.execute("SELECT 1 FROM queue WHERE user_id=? AND status='sent'", (uid,)).fetchone()
+    existing = db.execute("SELECT 1 FROM (SELECT user_id,status FROM queue UNION ALL SELECT user_id,status FROM resends) WHERE user_id=? AND status='sent'", (uid,)).fetchone()
     blocked = 1 if text in {"stop","/stop","berhenti","unsubscribe"} else 0
     name = " ".join(filter(None,[getattr(sender,"first_name",None),getattr(sender,"last_name",None)])) or str(uid)
     db.execute("""INSERT INTO contacts(user_id,name,username,last_inbound,replied_after_followup,blocked,updated_at) VALUES(?,?,?,?,?,?,?)
@@ -280,6 +399,7 @@ async def on_new_message(event):
       (uid,name,getattr(sender,"username",None),iso(event.message.date.astimezone(TZ)),1 if existing else 0,blocked,iso(),1 if existing else 0))
     if existing:
         db.execute("UPDATE queue SET status='replied' WHERE user_id=? AND status='pending'", (uid,))
+        db.execute("UPDATE resends SET status='replied' WHERE user_id=? AND status='pending'", (uid,))
     db.commit()
 
 async def queue_worker():
@@ -287,24 +407,27 @@ async def queue_worker():
         try:
             await asyncio.sleep(5)
             if setting("campaign_active") != "1" or not client or not await client.is_user_authorized(): continue
-            sent_today = db.execute("SELECT count(*) FROM queue WHERE status='sent' AND substr(sent_at,1,10)=?", (now().date().isoformat(),)).fetchone()[0]
+            sent_today = sent_today_count()
             if sent_today >= int(setting("daily_limit")): continue
-            item = db.execute("""SELECT q.* FROM queue q JOIN contacts c ON c.user_id=q.user_id
-              WHERE q.status='pending' AND q.due_at<=? AND c.blocked=0 AND c.replied_after_followup=0 ORDER BY q.due_at,q.id LIMIT 1""", (iso(),)).fetchone()
+            item = db.execute("""SELECT r.*, 'resends' source FROM resends r JOIN contacts c ON c.user_id=r.user_id
+              WHERE r.status='pending' AND r.due_at<=? AND c.blocked=0 ORDER BY r.due_at,r.id LIMIT 1""", (iso(),)).fetchone()
+            if not item:
+                item = db.execute("""SELECT q.*, 'queue' source FROM queue q JOIN contacts c ON c.user_id=q.user_id
+                  WHERE q.status='pending' AND q.due_at<=? AND c.blocked=0 AND c.replied_after_followup=0 ORDER BY q.due_at,q.id LIMIT 1""", (iso(),)).fetchone()
             if not item: continue
             try:
-                message_text = setting(f"message_{item['step']}")
+                message_text = item["message_text"] or setting(f"message_{item['step']}")
                 await client.send_message(item["user_id"], message_text)
-                sent = now(); db.execute("UPDATE queue SET status='sent',sent_at=?,error=NULL,message_text=? WHERE id=?", (iso(sent),message_text,item["id"]))
+                sent = now(); db.execute(f"UPDATE {item['source']} SET status='sent',sent_at=?,error=NULL,message_text=? WHERE id=?", (iso(sent),message_text,item["id"]))
                 db.execute("UPDATE contacts SET last_outbound=? WHERE user_id=?", (iso(sent),item["user_id"]))
-                if item["step"] == 1:
+                if item["source"] == "queue" and item["step"] == 1:
                     db.execute("INSERT OR IGNORE INTO queue(user_id,step,due_at) VALUES(?,2,?)", (item["user_id"],iso(sent+timedelta(hours=int(setting('step2_hours'))))))
                     db.execute("INSERT OR IGNORE INTO queue(user_id,step,due_at) VALUES(?,3,?)", (item["user_id"],iso(sent+timedelta(hours=int(setting('step3_hours'))))))
                 db.commit(); log("info", f"Follow-up tahap {item['step']} terkirim ke user {item['user_id']}")
             except FloodWaitError as e:
                 log("warning", f"Telegram meminta jeda {e.seconds} detik"); await asyncio.sleep(min(e.seconds + 5, 3600))
             except Exception as e:
-                db.execute("UPDATE queue SET status='failed',error=? WHERE id=?", (type(e).__name__,item["id"])); db.commit(); log("error", f"Gagal kirim user {item['user_id']}: {type(e).__name__}")
+                db.execute(f"UPDATE {item['source']} SET status='failed',error=? WHERE id=?", (type(e).__name__,item["id"])); db.commit(); log("error", f"Gagal kirim user {item['user_id']}: {type(e).__name__}")
             await asyncio.sleep(int(setting("interval_seconds")))
         except asyncio.CancelledError: break
         except Exception as e:
